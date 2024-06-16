@@ -1,8 +1,11 @@
 import mlflow
+from azureml.core import Workspace
+from azureml.core import Run
 
 from pathlib import Path
 import argparse
 import copy
+import json
 
 import pandas as pd
 import numpy as np
@@ -51,11 +54,15 @@ from generator import (
     save_loss_surfaces_plot,
     positive_curve,
 )
-from aligner import CLIPModel, CLIPCosineLoss
+# from aligner import CLIPModel, CLIPCosineLoss
+from aligner import TripletModel, AlignerLoss
 
 device = get_torch_device()
 
 def main(args, mlflow):
+
+    current_run = Run.get_context()
+    ws = current_run.experiment.workspace
 
     print(f'Torch Device {device}')
     # ----------------------------------------- Logging args as job parameters -----------------------------------------
@@ -69,62 +76,73 @@ def main(args, mlflow):
         
     # ----------------------------------------- read data -----------------------------------------
     print('Preparing Data...')
-    train = pd.read_csv(args.data+'/train_curated.csv')
-    validation = pd.read_csv(args.data+'/validation_curated.csv')
-    test = pd.read_csv(args.data+'/test_curated.csv')
-    datas = {'train':train, 'validation':validation, 'test':test}
+    import glob
+    train_path = glob.glob(args.data+'/train_*.csv')[0]
+    validation_path = glob.glob(args.data+'/validation_*.csv')[0]
+    train = pd.read_csv(train_path)
+    validation = pd.read_csv(validation_path)
+    datas = {'train':train, 'validation':validation}
 
 
     # ----------------------------------------- features -----------------------------------------
-    strategy_columns_cat = ['region', 'os', 'browser', 'gender', 'slotvisibility', 'slotformat']
-    strategy_columns_num = ['slotwidth', 'slotheight']
-    strategy_columns = strategy_columns_cat + strategy_columns_num
-    context_columns = ['advertiser_category', 'adexchange']
-    performance_columns = ['payprice']
+    strategy_columns = args.strategy_columns 
+    context_columns = args.context_columns
+    performance_column = args.score_column
 
 
     # ----------------------------------------- data preparation -----------------------------------------
-    # region Data Preparation
+    # region data preparation
+    norm_functs = {
+        'log': {'normalize': lambda x: np.log(x), 'denormalize': lambda x: torch.exp(x)},
+        'exp': {'normalize': lambda x: np.exp(x), 'denormalize': lambda x: torch.log(x)},
+        'scaled_log': {'normalize': lambda x: 10*np.log(x), 'denormalize': lambda x: torch.exp(x/10)},
+        'shifted_log': {'normalize': lambda x: 10+np.log(x), 'denormalize': lambda x: torch.exp(x-10)},
+        'min_max': {'normalize': lambda x: (x-args.score_min)/(args.score_max-args.score_min), 'denormalize': lambda x: x*(args.score_max-args.score_min)+args.score_min},
+        'sqrt': {'normalize': lambda x: np.sqrt(x), 'denormalize': lambda x: torch.power(x,2)},
+        'none': {'normalize': lambda x: x, 'denormalize': lambda x: x},
+    }
+
     normalizers = {
-        'slotwidth': lambda x: x/1200, 
-        'slotheight': lambda x: x/700, 
-        'payprice': lambda x: x/30
+        'score': norm_functs[args.normalize_score]['normalize']
     }
 
     denormalizers = {
-        'slotwidth': lambda x: x*1200,
-        'slotheight': lambda x: x*700,
-        'payprice': lambda x: x*30
+        'score': norm_functs[args.normalize_score]['denormalize']
     }
 
     for df_title in datas:
         df = datas[df_title]
-        df[context_columns + strategy_columns_cat] = df[context_columns + strategy_columns_cat].astype(str)
-        data = df[context_columns + strategy_columns + performance_columns]
-        #filtering
-        data = data[data[performance_columns[0]]>1]
+        df[context_columns + strategy_columns] = df[context_columns + strategy_columns].astype(str)
+        data = df[context_columns + strategy_columns + [performance_column]].copy()
         
         data.rename(columns={col_name: col_name+'_context' for col_name in context_columns }, inplace=True)
-        data.rename(columns={performance_columns[0]: 'score'}, inplace=True)
+        data.rename(columns={performance_column: 'score'}, inplace=True)
 
         for col in data:
             if data[col].dtype=="object":
-                data.fillna({col:''}, inplace=True)
+                data.fillna({col:''},inplace=True)
             else:
-                data.fillna({col:0}, inplace=True)
+                data.fillna({col:0},inplace=True)
         datas[df_title] = data
+
     context_columns = [col_name+'_context' for col_name in context_columns]
-    train, validation, test = datas['train'], datas['validation'], datas['test']
+    train, validation = datas['train'], datas['validation']
     del datas
 
-    features = extract_possible_values(pd.concat([train, validation, test]))
+    # score filtering
+    if args.filter_score:
+        train = train[(train['score']>=args.score_min) & (train['score']<=args.score_max)].copy()
+        validation = validation[(validation['score']>=args.score_min) & (validation['score']<=args.score_max)].copy()
+
+    features = extract_possible_values(pd.concat([train, validation]))
+    torch.save(features, "features")
+    mlflow.log_artifact('features', '.')
+
     feature_cols = features['context_features']['features_order'] + features['strategy_features']['features_order']
 
-    # train data cleaning
-    impression_threshold = 100
-    train = filter_by_impressions(train, impression_threshold, feature_cols)
-    validation = filter_by_impressions(validation, impression_threshold, feature_cols)
-    test = test.groupby(feature_cols).mean().reset_index()
+    if args.groupby_features:
+        train = train.groupby(feature_cols).mean().reset_index()
+        validation = validation.groupby(feature_cols).mean().reset_index()
 
     stats = train.groupby(features['context_features']['features_order']).agg(
                 min=pd.NamedAgg(column='score', aggfunc='min'), 
@@ -132,12 +150,16 @@ def main(args, mlflow):
                 max=pd.NamedAgg(column='score', aggfunc='max')
             ) 
     
+    minimize_mode = True if args.min_anchor_positiveness > 0.50 else False
+
     # context balancing
     max_count = train.groupby(context_columns).count()['score'].max()
     subsets = list()
     for group, idx in train.reset_index(drop=True).groupby(context_columns).groups.items():
         subset = train.iloc[idx].copy()
-        subset.loc[:, 'is_better'] = (subset['score'] > stats.loc[group]['mean']).values
+        subset.loc[:, 'is_better'] = (subset['score'] >= stats.loc[group]['mean']).values
+        if minimize_mode:
+            subset['is_better'] = ~subset['is_better']
         subsets.append(subset)
         positives = subset[subset.is_better]
         positives = [positives]*(max_count//len(positives))
@@ -149,36 +171,51 @@ def main(args, mlflow):
     for group, idx in validation.reset_index(drop=True).groupby(context_columns).groups.items():
         subset = validation.iloc[idx].copy()
         subset.loc[:, 'is_better'] = (subset['score'] > stats.loc[group]['mean']).values
+        if minimize_mode:
+            subset['is_better'] = ~subset['is_better']
         subsets.append(subset)
         positives = subset[subset.is_better]
         positives = [positives]*(max_count//len(positives))
         subsets += positives
     validation = pd.concat(subsets).sample(frac=1)
 
+    print('Train Shape', train.shape)
+    print('Validation Shape', validation.shape)
     # endregion
 
     # ----------------------------------------- Estimator loading -----------------------------------------
     # region Estimator Loading
-    latent_dim = 64
-    emb_dim = 128
     if args.embeddings_from_estimator == 1:
-        assert emb_dim == args.emb_size
-    strategy_estimator = ipinyouPriceMdeler(features, emb_dim, latent_dim, normalizers, denormalizers, output_size=1).to(device)
-    strategy_estimator.load_state_dict(torch.load('Estimator_epoch_999', map_location=device))
+        assert args.estimator_emb_dim == args.emb_size
+
+    uri = args.estimator_model_path
+    run_id = uri.split('dcid.')[1].split('/')[0]
+    run = ws.get_run(run_id)
+    file_to_download = uri.split('dcid.')[1][len(run_id)+1:]
+    run.download_file(file_to_download, 'estimator_model')
+    mlflow.log_artifact('estimator_model', '.')
+
+    strategy_estimator = ipinyouPriceMdeler(features, args.estimator_emb_dim, args.estimator_latent_dim, normalizers, denormalizers, output_size=1).to(device)
+    strategy_estimator.load_state_dict(torch.load('estimator_model', map_location=device))
     strategy_estimator.requires_grad_(False)
     strategy_estimator.eval()
+
     # endregion
 
 
     # ----------------------------------------- Aligner loading -----------------------------------------
     # region Aligner loading
-    projection_dim = 128
-    double_projection = 0
+    uri = args.aligner_model_path
+    run_id = uri.split('dcid.')[1].split('/')[0]
+    run = ws.get_run(run_id)
+    file_to_download = uri.split('dcid.')[1][len(run_id)+1:]
+    run.download_file(file_to_download, 'aligner_model')
+    mlflow.log_artifact('aligner_model', '.')
 
-    aligner_model = CLIPModel(strategy_estimator, strategy_embedding=latent_dim, projection_dim=projection_dim, double_projection=double_projection).to(device)
-    aligner_model.load_state_dict(torch.load('Aligner_epoch_3275', map_location=device))
+    aligner_model = TripletModel(strategy_estimator, strategy_embedding=args.estimator_latent_dim, projection_dim=args.aligner_projection_dim)
+    aligner_model.load_state_dict(torch.load('aligner_model', map_location=device))
     aligner_model.requires_grad_(False)
-    aligner_loss = CLIPCosineLoss('Aligner_epoch_3275', strategy_estimator, weight=args.cosine_weight)
+    aligner_loss = AlignerLoss(aligner_model, args.cosine_weight)
     # endregion
 
     # ----------------------------------------- Training Loop -----------------------------------------
@@ -187,7 +224,7 @@ def main(args, mlflow):
     # mtlwrapper = MultiTaskLossWrapper(task_num=2, reduction='none')
     
     # region Params
-    min_anchor_positiveness = 0.02
+    min_anchor_positiveness = args.min_anchor_positiveness
     max_anchor_positiveness = None
     sampling = False
     context_attn_factor = 1
@@ -287,21 +324,21 @@ def main(args, mlflow):
 
             if args.ce_combine == 'mean':
                 reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
-                reconstruction_loss += aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                reconstruction_loss += aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
                 reconstruction_loss = reconstruction_loss/2
             elif args.ce_combine == 'weight':
                 reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
-                reconstruction_loss += args.aligner_weight*aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                reconstruction_loss += args.aligner_weight*aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
             elif args.ce_combine == 'product':
                 reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
-                reconstruction_loss *= aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                reconstruction_loss *= aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
             elif args.ce_combine == 'ce_only':
                 reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
             elif args.ce_combine == 'aligner_only':
-                reconstruction_loss = aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                reconstruction_loss = aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
 
 
-            train_aligner_loss = aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+            train_aligner_loss = aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
 
             pos_mask = (p>=0.75)
             neut_mask = (p>=0.25)&(p<0.75)
@@ -318,8 +355,10 @@ def main(args, mlflow):
             generated_data_ix_tensors, _ = generated_to_data_ix_tensors(output, data_ix_tensors, features, sampling=sampling)
 
             # estimator_output = strategy_estimator(generated_data_ix_tensors)
-            estimator_output = F.softplus(strategy_estimator(generated_data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight))
-            estimated_scores = denormalizers[performance_columns[0]](estimator_output).flatten()
+            # estimator_output = F.softplus(strategy_estimator(generated_data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight))
+            estimator_output = strategy_estimator(generated_data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight)
+            estimated_scores = denormalizers["score"](estimator_output).flatten()
+            
             estimated_score_loss = 1 - score_positiveness(batch_data, estimated_scores, stats, features,
                                                         min_anchor_positiveness=min_anchor_positiveness, max_anchor_positiveness=max_anchor_positiveness, c_scaling=args.c_scaling)
             
@@ -412,20 +451,20 @@ def main(args, mlflow):
 
                 if args.ce_combine == 'mean':
                     reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
-                    reconstruction_loss += aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                    reconstruction_loss += aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
                     reconstruction_loss = reconstruction_loss/2
                 elif args.ce_combine == 'weight':
                     reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
-                    reconstruction_loss += args.aligner_weight*aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                    reconstruction_loss += args.aligner_weight*aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
                 elif args.ce_combine == 'product':
                     reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
-                    reconstruction_loss *= aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                    reconstruction_loss *= aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
                 elif args.ce_combine == 'ce_only':
                     reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
                 elif args.ce_combine == 'aligner_only':
-                    reconstruction_loss = aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                    reconstruction_loss = aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
 
-                validation_aligner_loss = aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                validation_aligner_loss = aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
 
                 pos_mask = p>=0.75
                 neut_mask = (p>=0.25)&(p<0.75)
@@ -441,8 +480,9 @@ def main(args, mlflow):
 
                 generated_data_ix_tensors, confidences = generated_to_data_ix_tensors(output, data_ix_tensors, features, sampling=sampling)
 
-                estimator_output = F.softplus(strategy_estimator(generated_data_ix_tensors))
-                estimated_scores = denormalizers[performance_columns[0]](estimator_output).flatten()
+                # estimator_output = F.softplus(strategy_estimator(generated_data_ix_tensors))
+                estimator_output = strategy_estimator(generated_data_ix_tensors)
+                estimated_scores = denormalizers["score"](estimator_output).flatten()
                 estimated_score_loss = 1 - score_positiveness(batch_data, estimated_scores, stats, features,
                                                             min_anchor_positiveness=min_anchor_positiveness, max_anchor_positiveness=max_anchor_positiveness, c_scaling=args.c_scaling)
                 
@@ -497,23 +537,24 @@ def main(args, mlflow):
 
                 if args.ce_combine == 'mean':
                     reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
-                    reconstruction_loss += aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                    reconstruction_loss += aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
                     reconstruction_loss = reconstruction_loss/2
                 elif args.ce_combine == 'weight':
                     reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
-                    reconstruction_loss += args.aligner_weight*aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                    reconstruction_loss += args.aligner_weight*aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
                 elif args.ce_combine == 'product':
                     reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
-                    reconstruction_loss *= aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                    reconstruction_loss *= aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
                 elif args.ce_combine == 'ce_only':
                     reconstruction_loss = reconstruction_loss/len(features['strategy_features']['features_order'])
                 elif args.ce_combine == 'aligner_only':
-                    reconstruction_loss = aligner_loss(data_ix_tensors, data_ix_tensors, from_logits=True, logits_dict=output, softmax_weight=args.softmax_weight).flatten()
+                    reconstruction_loss = aligner_loss.from_logits(output, data_ix_tensors, softmax_weight=args.softmax_weight).flatten()
 
                 generated_data_ix_tensors, confidences = generated_to_data_ix_tensors(output, data_ix_tensors, features, sampling=sampling)
 
-                estimator_output = F.softplus(strategy_estimator(generated_data_ix_tensors))
-                estimated_scores = denormalizers[performance_columns[0]](estimator_output).flatten()
+                # estimator_output = F.softplus(strategy_estimator(generated_data_ix_tensors))
+                estimator_output = strategy_estimator(generated_data_ix_tensors)
+                estimated_scores = denormalizers["score"](estimator_output).flatten()
                 estimated_score_loss = 1 - score_positiveness(batch_data, estimated_scores, stats, features,
                                                             min_anchor_positiveness=min_anchor_positiveness, max_anchor_positiveness=max_anchor_positiveness, c_scaling=args.c_scaling)
 
@@ -716,6 +757,7 @@ def get_argparser():
     parser.add_argument('--nfw', type=float)
     parser.add_argument('--new', type=float)
     parser.add_argument('--c_scaling', type=float, default=1.0)
+    parser.add_argument('--min_anchor_positiveness', type=float, default=0.02)
     parser.add_argument('--interpolating', type=int)
     parser.add_argument('--candidating', type=int)
     parser.add_argument('--candidating_members', type=int, default=1)
@@ -751,7 +793,22 @@ def get_argparser():
     parser.add_argument('--aligner_weight', type=float, default=1.0)
     parser.add_argument('--epochs', type=int, default=100)
     
+    # Data Prep
+    parser.add_argument("--strategy_columns", type=lambda x: x.split(','), required=True)
+    parser.add_argument("--context_columns", type=lambda x: x.split(','), required=True)
+    parser.add_argument("--score_column", type=str, required=True)
+    parser.add_argument("--score_max", type=float, default=10.0)
+    parser.add_argument("--score_min", type=float, default=0.01)
+    parser.add_argument("--normalize_score", type=str, default='none')
+    parser.add_argument("--filter_score", type=int, default=1)
+    parser.add_argument("--groupby_features", type=int, default=1)
 
+    # Estimator & Aligner
+    parser.add_argument("--estimator_latent_dim", type=int, default=128)
+    parser.add_argument("--estimator_emb_dim", type=int, default=128)
+    parser.add_argument("--estimator_model_path", type=str, required=True)
+    parser.add_argument("--aligner_projection_dim", type=int, default=128)
+    parser.add_argument("--aligner_model_path", type=str, required=True)
     return parser
 
 

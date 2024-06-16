@@ -118,5 +118,5 @@ class ipinyouPriceMdeler(nn.Module):
         combined = F.relu(torch.cat([dcn_out, out2], dim=-1))
         
         #out = self.linear3(out2)
-        lt = torch.sigmoid(self.latent(combined))
+        lt = F.relu(self.latent(combined))
         return lt

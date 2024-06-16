@@ -312,16 +312,17 @@ def calculate_hamming_distance(generated, df, features):
     top_k_tmp = generated.copy()
     our_hammings_list = list()
     # for current_context in top_k_tmp.index.unique():
-    for c1, c2 in top_k_tmp.reset_index().groupby(context_cols).groups:
-        current_context = (c1, c2)
+    for current_context in top_k_tmp.reset_index().groupby(context_cols).groups:
         my_results = top_k_tmp.loc[[current_context]]
         current_context_dfs = [my_results]
-        cdf = df[(df.advertiser_category_context==current_context[0])&(df.adexchange_context==current_context[1])].drop_duplicates()
-        cdf = cdf.set_index(['advertiser_category_context', 'adexchange_context'])
+        # cdf = df[(df.advertiser_category_context==current_context[0])&(df.adexchange_context==current_context[1])].drop_duplicates()
+        cdf = df.query(' & '.join([ f'`{context_col}`=="{current_context[i]}"' for i, context_col in enumerate(context_cols)])).drop_duplicates()
+        cdf = cdf.set_index(context_cols)
         cdf = cdf[cdf['is_better']]
         
         cdfmat = cdf[cols].values
-
+        if len(cdfmat)==0:
+            continue
         all_our_hammings = list()
         for i in range(len(current_context_dfs)):
             hammings = list()
@@ -333,39 +334,36 @@ def calculate_hamming_distance(generated, df, features):
                 hammings.append(min(tmp))
             our_hamming = np.mean(hammings)
             all_our_hammings.append(our_hamming)
-        our_hammings_list.append({
-            context_cols[0]: c1,
-            context_cols[1]: c2,
-            'hamming_distance': np.mean(all_our_hammings)
-        })
+        
+        tmp_dict = dict()
+        for i, context_col in enumerate(context_cols):
+            tmp_dict[context_col] = current_context[i]
+        tmp_dict['hamming_distance'] = np.mean(all_our_hammings)
+        our_hammings_list.append(tmp_dict)
         
     hammings = pd.DataFrame(our_hammings_list)
     return hammings['hamming_distance'].mean(), hammings
 
 
 def calculate_cosine_similarity(generated, df, features, aligner_model):
+    context_cols = features['context_features']['features_order']
     top_k_tmp = generated.copy()
     cosines_dfs = list()
     for current_context in top_k_tmp.index.unique():
         my_results = top_k_tmp.loc[[current_context]]
-        cdf = df[(df.advertiser_category_context==current_context[0])&(df.adexchange_context==current_context[1])].drop_duplicates()
-        cdf = cdf.set_index(['advertiser_category_context', 'adexchange_context'])
+        cdf = df.query(' & '.join([ f'`{context_col}`=="{current_context[i]}"' for i, context_col in enumerate(context_cols)])).drop_duplicates()
+        cdf = cdf.set_index(context_cols)
         cdf = cdf[cdf['is_better']]
-        
+        if len(cdf)==0:
+            continue
         all_out_cosine = list()
 
         for i in range(len(my_results)):
             gen_ix_tensors = df_to_ix_tensors(my_results.iloc[[i]*len(cdf)].reset_index(), features)
             dat_ix_tensors = df_to_ix_tensors(cdf.reset_index(), features)
-            source_embeddings, target_embeddings, _ = aligner_model(
-                {
-                    "source":dat_ix_tensors,
-                    "target":gen_ix_tensors,
-                },
-                inference = True,
-            )
-            
-            max_cosine_sim = F.cosine_similarity(source_embeddings, target_embeddings).max().item()
+
+            cosines = aligner_model.cosine_similarity(gen_ix_tensors, dat_ix_tensors)
+            max_cosine_sim = cosines.max().item()
         
             all_out_cosine.append(max_cosine_sim)
         my_results['cosine_sim'] = all_out_cosine

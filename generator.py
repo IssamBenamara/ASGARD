@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import plotly.graph_objects as go
 from vector_quantize_pytorch import FSQ
-from aligner import CLIPModel
+from aligner import AlignerModule
 from utils import construct_embedding_module, get_torch_device, patch_attention, save_outputs
 from utils import TokenPlacement, InstancingType, boolean_indexing
 from custom_layers import CustomTransformerEncoder, CustomTransformerEncoderLayer, CustomTransformerDecoder, CustomTransformerDecoderLayer
@@ -23,7 +23,7 @@ class ASGAR(nn.Module):
                  positional_encodings=False,
                  n_sampling_choices=0,
                  pretrained_embeddings=None,
-                 aligner_model:CLIPModel=None,
+                 aligner_model:AlignerModule=None,
                  type_embedding_weight:float=1.0,
                  use_bias=True,
                  wide_ffns=True,
@@ -78,7 +78,7 @@ class ASGAR(nn.Module):
             self.aligner_model = aligner_model
             self.aligner_model.requires_grad_(False)
             self.aligner_model.eval()
-            self.aligner_projection_dim = self.aligner_model.source_projection.fc.in_features
+            self.aligner_projection_dim = self.aligner_model.projection_dim
             self.aligner_to_emb = nn.Linear(self.aligner_projection_dim, self.emb_size)
         else:
             self.aligner_model = None
@@ -198,7 +198,7 @@ class ASGAR(nn.Module):
         if self.first_printed < 2:
             print(s)
 
-    def forward(self, data_ix_tensors, p=None, candidating=False, from_indices=None, guiding=None, masking_rate=0.5):
+    def forward(self, data_ix_tensors, p=None, candidating=False, from_indices=None, guiding=None, masking_rate=0.5, guiding_tokens=None):
         chosen_samples=None
         indices = None
         variational_mean = None
@@ -218,7 +218,7 @@ class ASGAR(nn.Module):
         
 
         # Input Tensor
-        input_tensor = self.get_encoder_input_tensors(data_ix_tensors, p=p, candidating=candidating, guiding=guiding, masking_rate=masking_rate) #shape: (batch_size, sequence_len, embedding_dim)
+        input_tensor = self.get_encoder_input_tensors(data_ix_tensors, p=p, candidating=candidating, guiding=guiding, masking_rate=masking_rate, guiding_tokens=guiding_tokens) #shape: (batch_size, sequence_len, embedding_dim)
         batch_size = input_tensor.shape[0]
         if self.context_placement in [TokenPlacement.SUMMED_TO_ENCODER, TokenPlacement.SUMMED_TO_ENCODER_DECODER]:
             self.first_print(f'Context Placement Summed to Encoder Input')
@@ -228,13 +228,7 @@ class ASGAR(nn.Module):
         # Instance Projection
         if self.aligner_model:
             if from_indices is None:
-                instance_projection, _, _ = self.aligner_model(
-                        {
-                            "source":data_ix_tensors,
-                            "target":data_ix_tensors,
-                        },
-                        inference = True,
-                    )
+                instance_projection = self.aligner_model.projection(data_ix_tensors)
                 instance_projection = self.aligner_to_emb(instance_projection)
                 instance_projection = instance_projection.view(batch_size, 1, self.emb_size)
             if self.instancing_type == InstancingType.QUANTIZATION:
@@ -387,13 +381,7 @@ class ASGAR(nn.Module):
 
         # Instance Projection
         if self.aligner_model:
-            instance_projection, _, _ = self.aligner_model(
-                    {
-                        "source":data_ix_tensors,
-                        "target":data_ix_tensors,
-                    },
-                    inference = True,
-                )
+            instance_projection = self.aligner_model.projection(data_ix_tensors)
             instance_projection = self.aligner_to_emb(instance_projection)
             instance_projection = instance_projection.view(batch_size, 1, self.emb_size)
             instance_projection = self.encoder_fsq(instance_projection).view(batch_size,len(self.fsq_levels),1,self.n_quantized_tokens)
@@ -426,7 +414,7 @@ class ASGAR(nn.Module):
         return input_tensors 
 
 
-    def get_encoder_input_tensors(self, data_ix_tensors, p=None, candidating=None, guiding=None, masking_rate=0.0):
+    def get_encoder_input_tensors(self, data_ix_tensors, p=None, candidating=None, guiding=None, masking_rate=0.0, guiding_tokens=None):
         
         first_context_column = self.features['context_features']['features_order'][0]
         batch_size = len(data_ix_tensors['context_features'][first_context_column])
@@ -518,8 +506,15 @@ class ASGAR(nn.Module):
             for col in self.features['strategy_features']['features_order']:
                 d = self.features['strategy_features']['features'][col]
                 vocab_ixs = torch.arange(0, len(d['values']), dtype=torch.int, device=self.device).expand(batch_size,-1)
-                instance_ixs = data_ix_tensors['strategy_features'][col]
-                data_mask = torch.where((vocab_ixs - instance_ixs) == 0, 1, 0).to(self.device) # (batch_size, vocab_size) vocab where 1 is instance value and 0 is other values
+                if guiding_tokens:
+                    tokens = guiding_tokens.get(col, [])
+                    pre_mask = torch.ones_like(vocab_ixs)
+                    for token_ix in tokens:
+                        pre_mask *= (vocab_ixs - token_ix)
+                else:
+                    instance_ixs = data_ix_tensors['strategy_features'][col]
+                    pre_mask = (vocab_ixs - instance_ixs)
+                data_mask = torch.where(pre_mask == 0, 1, 0).to(self.device) # (batch_size, vocab_size) vocab where 1 is instance value and 0 is other values
                 data_mask = data_mask*((torch.rand((batch_size,1),device=self.device)>=masking_rate)*1) # randomly consider an instance token as neutral
                 reconst_avoid_embedding = self.special_tokens[col](data_mask*pos_code) #(batch_size, vocab_size, emb_size) all vocab but with [reconstruct], [avoid], [neutral] embeddings
                 value_embedding = self.embeddings['item_embeddings'][col](vocab_ixs).view(batch_size, -1, self.emb_size) #shape: (batch_size, current_feature_vocab_len, emb_dim)
