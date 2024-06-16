@@ -1,0 +1,17 @@
+# data science
+numpy
+scipy
+pandas
+scikit-learn
+torch
+seaborn
+vector-quantize-pytorch
+pytorch_warmup
+
+#viz
+plotly
+kaleido
+
+# tracking
+mlflow
+azureml-mlflow
